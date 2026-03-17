@@ -1,22 +1,21 @@
 import os
-# עקיפת חסימת הרשת של ווינדוס/אנטי-וירוס
+# עקיפת חסימת הרשת של ווינדוס/אנטי-וירוס (למקרה שתריץ שוב מקומית)
 if "SSLKEYLOGFILE" in os.environ:
     del os.environ["SSLKEYLOGFILE"]
 
 from fastapi import FastAPI, HTTPException
+from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 from datetime import datetime, timedelta, timezone
 import requests
 import math
 
-app = FastAPI(title="Route Weather API - Smart Analysis")
+app = FastAPI(title="DryRide API - Smart Routing & Weather")
 
-from fastapi.middleware.cors import CORSMiddleware
-
-# הוספת הרשאת CORS כדי שהדפדפן יוכל לדבר עם השרת
+# --- הרשאות CORS כדי שהדפדפן (Netlify) יוכל לגשת לשרת (Render) ---
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"], # מאפשר לכל אתר לפנות לשרת (מצוין לפיתוח)
+    allow_origins=["*"],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -26,13 +25,13 @@ app.add_middleware(
 class RouteRequest(BaseModel):
     origin: str = Field(..., description="נקודת התחלה")
     destination: str = Field(..., description="נקודת יעד")
-    departure_time: datetime = Field(..., description="זמן יציאה מתוכנן")
+    departure_time: datetime = Field(..., description="זמן יציאה מתוכנן בפורמט UTC")
 
 class WaypointWeather(BaseModel):
     location_name: str
     lat: float
     lon: float
-    eta: datetime
+    local_time: str  # שומרים מחרוזת של השעה המקומית המדויקת ביעד
     driving_time_minutes: int
     weather_condition: str
     temperature: float
@@ -58,7 +57,8 @@ def get_coordinates(city_name: str):
     response = requests.get(url, headers=headers)
     data = response.json()
     if not data:
-        raise ValueError(f"לא הצלחנו למצוא את המיקום: {city_name}")
+        # כאן אנחנו זורקים שגיאה חכמה שתיתפס על ידי ה-API
+        raise ValueError(f"לא הצלחנו למצוא את המיקום: '{city_name}'. אנא בדוק את האיות ונסה שוב.")
     return float(data[0]['lat']), float(data[0]['lon'])
 
 def haversine_distance(lat1, lon1, lat2, lon2):
@@ -76,7 +76,7 @@ def get_route_with_intervals(lat1: float, lon1: float, lat2: float, lon2: float)
     data = response.json()
     
     if data.get("code") != "Ok":
-        raise ValueError("לא הצלחנו לחשב מסלול בין הנקודות.")
+        raise ValueError("לא הצלחנו לחשב מסלול נסיעה בין הנקודות שבחרת.")
         
     route = data["routes"][0]
     total_distance_km = round(route["distance"] / 1000.0, 1)
@@ -91,7 +91,7 @@ def get_route_with_intervals(lat1: float, lon1: float, lat2: float, lon2: float)
         
     actual_total_dist = cum_distances[-1] if cum_distances[-1] > 0 else 1
     waypoints = []
-    interval_sec = 10 * 60 
+    interval_sec = 10 * 60 # דגימה כל 10 דקות לרזולוציה גבוהה
     
     waypoints.append({"lat": coordinates[0][1], "lon": coordinates[0][0], "duration_from_start_sec": 0, "type": "התחלה"})
     
@@ -113,36 +113,45 @@ def get_route_with_intervals(lat1: float, lon1: float, lat2: float, lon2: float)
         
     return waypoints, total_distance_km, total_duration_sec
 
-def get_real_weather(lat: float, lon: float, target_time: datetime):
-    target_hour_str = target_time.strftime('%Y-%m-%dT%H:00')
+def get_real_weather(lat: float, lon: float, target_time_utc: datetime):
     url = "https://api.open-meteo.com/v1/forecast"
     params = {
         "latitude": lat,
         "longitude": lon,
         "hourly": "temperature_2m,precipitation,precipitation_probability,weathercode",
-        "timezone": "auto"
+        "timezone": "auto" # מאפשר לשרת להחזיר לנו את ה-offset המקומי
     }
     
     response = requests.get(url, params=params)
     data = response.json()
     
     try:
+        # שליפת הפרש השעות של המיקום הספציפי ביחס ל-UTC
+        offset_sec = data.get('utc_offset_seconds', 0)
+        
+        # חישוב השעה המקומית המדויקת ביעד
+        target_local = target_time_utc + timedelta(seconds=offset_sec)
+        target_hour_str = target_local.strftime('%Y-%m-%dT%H:00')
+        
         times_list = data['hourly']['time']
         time_index = times_list.index(target_hour_str)
+        
         temp = data['hourly']['temperature_2m'][time_index]
         precip = data['hourly']['precipitation'][time_index]
         prob = data['hourly']['precipitation_probability'][time_index] 
         weather_code = data['hourly']['weathercode'][time_index]
         condition = "Rain" if weather_code >= 51 else "Clear/Cloudy"
-        return {"condition": condition, "temp": temp, "precipitation": precip, "prob": prob}
+        
+        return {"condition": condition, "temp": temp, "precipitation": precip, "prob": prob, "local_time_str": target_hour_str}
     except (ValueError, KeyError):
-        return {"condition": "Unknown", "temp": 0.0, "precipitation": 0.0, "prob": 0}
+        return {"condition": "Unknown", "temp": 0.0, "precipitation": 0.0, "prob": 0, "local_time_str": ""}
 
 # --- ה-Endpoint המרכזי ---
 @app.post("/api/v1/check-route", response_model=RouteResponse)
 def check_route_weather(request: RouteRequest):
-    now = datetime.now(timezone.utc)
-    if request.departure_time < now - timedelta(hours=1):
+    # ודא שהזמן הוא UTC
+    now_utc = datetime.now(timezone.utc)
+    if request.departure_time < now_utc - timedelta(hours=1):
         raise HTTPException(status_code=400, detail="זמן היציאה לא יכול להיות בעבר.")
         
     try:
@@ -155,8 +164,10 @@ def check_route_weather(request: RouteRequest):
         results = []
         for wp in raw_waypoints:
             driving_mins = int(wp["duration_from_start_sec"] / 60)
-            eta = request.departure_time + timedelta(seconds=wp["duration_from_start_sec"])
-            weather_data = get_real_weather(wp["lat"], wp["lon"], eta)
+            
+            # מחשבים את שעת ההגעה לנקודה ב-UTC ושולחים לפונקציה שתמיר למקומי
+            eta_utc = request.departure_time + timedelta(seconds=wp["duration_from_start_sec"])
+            weather_data = get_real_weather(wp["lat"], wp["lon"], eta_utc)
             
             loc_name = f"{wp['type']} (קואורדינטות {round(wp['lat'], 2)}, {round(wp['lon'], 2)})"
             if wp['type'] == "התחלה": loc_name = request.origin
@@ -166,7 +177,7 @@ def check_route_weather(request: RouteRequest):
                 location_name=loc_name,
                 lat=wp["lat"],
                 lon=wp["lon"],
-                eta=eta,
+                local_time=weather_data["local_time_str"],
                 driving_time_minutes=driving_mins,
                 weather_condition=weather_data["condition"],
                 temperature=weather_data["temp"],
@@ -174,24 +185,20 @@ def check_route_weather(request: RouteRequest):
                 rain_chance_percent=weather_data["prob"]
             ))
             
-        # --- ניתוח חכם של המסלול ---
+        # --- ניתוח חכם ---
         origin_weather = results[0]
         destination_weather = results[-1]
         
         max_rain_point = None
         max_rain_chance = 0
         transitions = []
-        
-        # המצב בתחילת הנסיעה
         is_currently_raining = origin_weather.rain_chance_percent > 0
         
         for wp in results:
-            # בדיקת נקודת הגשם המקסימלית
             if wp.rain_chance_percent > max_rain_chance:
                 max_rain_chance = wp.rain_chance_percent
                 max_rain_point = wp
                 
-            # מעקב אחרי שינויים (מעברים) בין גשם ליבש
             is_raining_at_wp = wp.rain_chance_percent > 0
             if is_raining_at_wp and not is_currently_raining:
                 transitions.append(f"כניסה לאזור עם סיכוי לגשם ({wp.rain_chance_percent}%) אחרי {wp.driving_time_minutes} דקות נסיעה.")
@@ -212,4 +219,5 @@ def check_route_weather(request: RouteRequest):
         return RouteResponse(summary=summary, waypoints=results)
         
     except ValueError as e:
+        # תופס את השגיאות הידידותיות שכתבנו למעלה ומחזיר אותן ללקוח
         raise HTTPException(status_code=400, detail=str(e))
