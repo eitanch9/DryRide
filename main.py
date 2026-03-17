@@ -1,19 +1,26 @@
 import os
-if "SSLKEYLOGFILE" in os.environ:
-    del os.environ["SSLKEYLOGFILE"]
-
-from fastapi import FastAPI, HTTPException
+import time
+from urllib.parse import quote
+from fastapi import FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 from datetime import datetime, timedelta, timezone
 import requests
 import math
 
-app = FastAPI(title="DryRide API - Smart Routing & Weather")
+# עקיפת חסימת הרשת של ווינדוס (לפיתוח מקומי)
+if "SSLKEYLOGFILE" in os.environ:
+    del os.environ["SSLKEYLOGFILE"]
 
+app = FastAPI(title="DryRide API - Smart Routing & Weather (Secured)")
+
+# 1. אבטחת CORS: רק האתר שלך מורשה לדבר עם השרת!
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=[
+        "https://my-drop-123.netlify.app",
+        "https://my-drop-123.netlify.app/"
+    ],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -48,36 +55,68 @@ class RouteResponse(BaseModel):
     summary: RouteSummary
     waypoints: list[WaypointWeather]
 
-# זיכרון מטמון (Cache) לשמירת קואורדינטות של ערים מוכרות כדי לחסוך פניות לרשת
+# --- מערכות אבטחה בזיכרון ---
 GEO_CACHE = {}
+IP_TRACKER = {}
+MAX_REQUESTS_PER_MINUTE = 5
 
-# --- מנגנון התעוררות (Ping) ---
+def check_rate_limit(request: Request):
+    """מנגנון חסימת הצפות (Rate Limiter)"""
+    # Render מעביר את ה-IP האמיתי דרך ההדר הזה
+    forwarded = request.headers.get("X-Forwarded-For")
+    client_ip = forwarded.split(",")[0] if forwarded else request.client.host
+
+    now = time.time()
+    
+    # מנקה בקשות ישנות (מעל דקה) של אותו משתמש
+    if client_ip in IP_TRACKER:
+        IP_TRACKER[client_ip] = [t for t in IP_TRACKER[client_ip] if now - t < 60]
+    else:
+        IP_TRACKER[client_ip] = []
+
+    # בודק אם עברנו את המכסה
+    if len(IP_TRACKER[client_ip]) >= MAX_REQUESTS_PER_MINUTE:
+        raise HTTPException(status_code=429, detail="ביצעת יותר מדי חיפושים. אנא המתן דקה ונסה שוב.")
+
+    IP_TRACKER[client_ip].append(now)
+
+    # הגנה על מנגנון ההגנה: אם הזיכרון מתמלא, מנקים אותו
+    if len(IP_TRACKER) > 1000:
+        IP_TRACKER.clear()
+
+# --- מנגנון התעוררות ---
 @app.get("/api/v1/ping")
 def wake_up():
     return {"status": "awake"}
 
 # --- פונקציות עזר מוגנות ---
 def get_coordinates(city_name: str):
-    # בדיקה בזיכרון המקומי קודם
     if city_name in GEO_CACHE:
         return GEO_CACHE[city_name]
         
-    url = f"https://nominatim.openstreetmap.org/search?q={city_name}&format=json&limit=1"
-    headers = {"User-Agent": "DryRideApp/1.1"}
+    # 2. קידוד בטוח של הכתובת (URL Encoding) למניעת הזרקות
+    safe_city_name = quote(city_name)
+    url = f"https://nominatim.openstreetmap.org/search?q={safe_city_name}&format=json&limit=1"
+    headers = {"User-Agent": "DryRideApp/1.2"}
+    
     try:
-        # הוספנו סטופר של 10 שניות
         response = requests.get(url, headers=headers, timeout=10)
-        response.raise_for_status() # מוודא שהשרת החיצוני לא החזיר שגיאה 500
+        response.raise_for_status()
         data = response.json()
         
         if not data:
             raise ValueError(f"לא הצלחנו למצוא את המיקום: '{city_name}'. אנא בדוק את האיות.")
             
         lat, lon = float(data[0]['lat']), float(data[0]['lon'])
-        GEO_CACHE[city_name] = (lat, lon) # שמירה לזיכרון לפעם הבאה
+        
+        # 3. מניעת פיצוץ זיכרון ב-Cache
+        if len(GEO_CACHE) > 100:
+            GEO_CACHE.clear()
+            
+        GEO_CACHE[city_name] = (lat, lon)
         return lat, lon
     except requests.exceptions.RequestException:
-        raise ValueError("שירות חיפוש הערים אינו זמין כרגע או איטי מדי. נסה שוב בעוד דקה.")
+        raise ValueError("שירות חיפוש הערים אינו זמין כרגע. נסה שוב בעוד דקה.")
 
 def haversine_distance(lat1, lon1, lat2, lon2):
     R = 6371.0 
@@ -91,19 +130,17 @@ def haversine_distance(lat1, lon1, lat2, lon2):
 def get_route_with_intervals(lat1: float, lon1: float, lat2: float, lon2: float):
     url = f"http://router.project-osrm.org/route/v1/driving/{lon1},{lat1};{lon2},{lat2}?geometries=geojson&overview=full"
     try:
-        # פה נתנו 15 שניות כי חישוב מסלול יכול לקחת מעט יותר זמן
         response = requests.get(url, timeout=15)
         data = response.json()
         
         if data.get("code") != "Ok":
-            raise ValueError("לא הצלחנו לחשב מסלול נסיעה בין הנקודות. ייתכן ואין כביש מקשר.")
+            raise ValueError("לא הצלחנו לחשב מסלול נסיעה בין הנקודות.")
             
         route = data["routes"][0]
         total_distance_km = round(route["distance"] / 1000.0, 1)
         
-        # הגנת אורך מסלול: חוסם מסלולים מעל 600 ק"מ
         if total_distance_km > 600:
-            raise ValueError(f"המסלול ארוך מדי ({total_distance_km} ק\"מ). המערכת תומכת במסלולים של עד 600 ק\"מ כדי להבטיח אמינות תחזית.")
+            raise ValueError(f"המסלול ארוך מדי ({total_distance_km} ק\"מ). המערכת תומכת במסלולים של עד 600 ק\"מ.")
             
         total_duration_sec = route["duration"]
         coordinates = route["geometry"]["coordinates"]
@@ -146,7 +183,7 @@ def get_real_weather(lat: float, lon: float, target_time_utc: datetime):
     }
     
     try:
-        response = requests.get(url, params=params, timeout=10) # סטופר 10 שניות
+        response = requests.get(url, params=params, timeout=10)
         data = response.json()
         
         offset_sec = data.get('utc_offset_seconds', 0)
@@ -165,18 +202,22 @@ def get_real_weather(lat: float, lon: float, target_time_utc: datetime):
         
         return {"condition": condition, "temp": temp, "precipitation": precip, "prob": prob, "local_time_str": exact_time_str}
     except (ValueError, KeyError, requests.exceptions.RequestException, IndexError):
-        # תופס כל שגיאת רשת או שינוי במבנה הנתונים של מזג האוויר ומחזיר ברירת מחדל בטוחה
         return {"condition": "Unknown", "temp": 0.0, "precipitation": 0.0, "prob": 0, "local_time_str": exact_time_str if 'exact_time_str' in locals() else "--:--"}
 
+# הוספנו את ה-Request כפרמטר כדי לבדוק את ה-IP
 @app.post("/api/v1/check-route", response_model=RouteResponse)
-def check_route_weather(request: RouteRequest):
+def check_route_weather(route_request: RouteRequest, req: Request):
+    
+    # 4. בודק אם המשתמש הציף את השרת לפני שהוא מעבד את הבקשה
+    check_rate_limit(req)
+    
     now_utc = datetime.now(timezone.utc)
-    if request.departure_time < now_utc - timedelta(hours=1):
+    if route_request.departure_time < now_utc - timedelta(hours=1):
         raise HTTPException(status_code=400, detail="זמן היציאה לא יכול להיות בעבר.")
         
     try:
-        lat1, lon1 = get_coordinates(request.origin)
-        lat2, lon2 = get_coordinates(request.destination)
+        lat1, lon1 = get_coordinates(route_request.origin)
+        lat2, lon2 = get_coordinates(route_request.destination)
         
         raw_waypoints, total_distance, total_duration = get_route_with_intervals(lat1, lon1, lat2, lon2)
         duration_minutes = round(total_duration / 60)
@@ -184,12 +225,12 @@ def check_route_weather(request: RouteRequest):
         results = []
         for wp in raw_waypoints:
             driving_mins = int(wp["duration_from_start_sec"] / 60)
-            eta_utc = request.departure_time + timedelta(seconds=wp["duration_from_start_sec"])
+            eta_utc = route_request.departure_time + timedelta(seconds=wp["duration_from_start_sec"])
             weather_data = get_real_weather(wp["lat"], wp["lon"], eta_utc)
             
             loc_name = f"{wp['type']} (קואורדינטות {round(wp['lat'], 2)}, {round(wp['lon'], 2)})"
-            if wp['type'] == "התחלה": loc_name = request.origin
-            if wp['type'] == "סיום": loc_name = request.destination
+            if wp['type'] == "התחלה": loc_name = route_request.origin
+            if wp['type'] == "סיום": loc_name = route_request.destination
             
             results.append(WaypointWeather(
                 location_name=loc_name,
