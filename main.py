@@ -119,19 +119,21 @@ def get_real_weather(lat: float, lon: float, target_time_utc: datetime):
         "latitude": lat,
         "longitude": lon,
         "hourly": "temperature_2m,precipitation,precipitation_probability,weathercode",
-        "timezone": "auto" # מאפשר לשרת להחזיר לנו את ה-offset המקומי
+        "timezone": "auto" 
     }
     
     response = requests.get(url, params=params)
     data = response.json()
     
     try:
-        # שליפת הפרש השעות של המיקום הספציפי ביחס ל-UTC
         offset_sec = data.get('utc_offset_seconds', 0)
         
-        # חישוב השעה המקומית המדויקת ביעד
-        target_local = target_time_utc + timedelta(seconds=offset_sec)
-        target_hour_str = target_local.strftime('%Y-%m-%dT%H:00')
+        # 1. חישוב השעה המדויקת (עם הדקות) בשביל להציג למשתמש באפליקציה
+        target_local_exact = target_time_utc + timedelta(seconds=offset_sec)
+        exact_time_str = target_local_exact.strftime('%Y-%m-%dT%H:%M')
+        
+        # 2. חישוב שעה עגולה (00:) רק בשביל לשלוף את הנתונים ממזג האוויר
+        target_hour_str = target_local_exact.strftime('%Y-%m-%dT%H:00')
         
         times_list = data['hourly']['time']
         time_index = times_list.index(target_hour_str)
@@ -142,10 +144,10 @@ def get_real_weather(lat: float, lon: float, target_time_utc: datetime):
         weather_code = data['hourly']['weathercode'][time_index]
         condition = "Rain" if weather_code >= 51 else "Clear/Cloudy"
         
-        return {"condition": condition, "temp": temp, "precipitation": precip, "prob": prob, "local_time_str": target_hour_str}
+        # שים לב: אנחנו מחזירים פה את exact_time_str המדויק
+        return {"condition": condition, "temp": temp, "precipitation": precip, "prob": prob, "local_time_str": exact_time_str}
     except (ValueError, KeyError):
         return {"condition": "Unknown", "temp": 0.0, "precipitation": 0.0, "prob": 0, "local_time_str": ""}
-
 # --- ה-Endpoint המרכזי ---
 @app.post("/api/v1/check-route", response_model=RouteResponse)
 def check_route_weather(request: RouteRequest):
