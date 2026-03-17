@@ -18,8 +18,8 @@ app = FastAPI(title="DryRide API - Smart Routing & Weather (Secured)")
 app.add_middleware(
     CORSMiddleware,
     allow_origins=[
-        "https://my-drop-123.netlify.app",
-        "https://my-drop-123.netlify.app/"
+        "https://dry-ride.netlify.app",
+        "https://dry-ride.netlify.app/"
     ],
     allow_credentials=True,
     allow_methods=["*"],
